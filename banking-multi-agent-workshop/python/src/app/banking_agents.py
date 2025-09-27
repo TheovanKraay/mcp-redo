@@ -7,6 +7,7 @@ import json
 from langchain_core.messages import ToolMessage, SystemMessage
 from langchain.schema import AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 from typing import Literal
 from langgraph.graph import StateGraph, START, MessagesState
 from langgraph.prebuilt import create_react_agent
@@ -18,6 +19,12 @@ from src.app.services.azure_open_ai import model
 #from src.app.services.local_model import model  # Use local model for testing
 from src.app.services.azure_cosmos_db import DATABASE_NAME, checkpoint_container, chat_container, \
     update_chat_container, patch_active_agent
+
+# Uncomment these if you want to use custom OAuth configuration
+# try:
+#     from fastmcp.client.auth import OAuth
+# except ImportError:
+#     print("fastmcp not available, OAuth configuration will not be available")
 
 local_interactive_mode = False
 
@@ -41,19 +48,81 @@ def load_prompt(agent_name):
 def filter_tools_by_prefix(tools, prefixes):
     return [tool for tool in tools if any(tool.name.startswith(prefix) for prefix in prefixes)]
 
+# Global variables for persistent session management
+_mcp_client = None
+_session_context = None
+_persistent_session = None
+
 async def setup_agents():
     global coordinator_agent, customer_support_agent, transactions_agent, sales_agent
+    global _mcp_client, _session_context, _persistent_session
 
-    print("Starting unified Banking Tools MCP client...")
-    mcp_client = MultiServerMCPClient({
+    print("🚀 Starting unified Banking Tools MCP client...")
+    
+    # Load authentication configuration
+    try:
+        from dotenv import load_dotenv
+        load_dotenv('.env.oauth')
+        simple_token = os.getenv("MCP_AUTH_TOKEN")
+        github_client_id = os.getenv("GITHUB_CLIENT_ID")
+        github_client_secret = os.getenv("GITHUB_CLIENT_SECRET")
+        
+        print("🔐 Client Authentication Configuration:")
+        print(f"   Simple Token: {'SET' if simple_token else 'NOT SET'}")
+        print(f"   GitHub OAuth: {'SET' if github_client_id and github_client_secret else 'NOT SET'}")
+        
+        # Determine authentication mode (same logic as server)
+        if github_client_id and github_client_secret:
+            auth_mode = "github_oauth"
+            print("   Mode: GitHub OAuth (Production)")
+        elif simple_token:
+            auth_mode = "simple_token" 
+            print(f"   Mode: Simple Token (Development)")
+            print(f"   Token: {simple_token[:8]}...")
+        else:
+            auth_mode = "none"
+            print("   Mode: No Authentication")
+            
+    except ImportError:
+        auth_mode = "none"
+        simple_token = None
+        print("🔐 Client Authentication: Dependencies unavailable - no auth")
+    
+    print("   - Transport: streamable_http")
+    print("   - Server URL: http://localhost:8000/mcp/")
+    print(f"   - Authentication: {auth_mode.upper()}")
+    print("   - Status: Ready to connect\\n")
+    
+    # MCP Client configuration based on authentication mode
+    client_config = {
         "banking_tools": {
-            "command": "python",
-            "args": ["-m", "src.app.tools.mcp_server"], 
-            "transport": "stdio",
-        },
-    })
+            "transport": "streamable_http",
+            "url": "http://localhost:8000/mcp/",
+        }
+    }
+    
+    # Add authentication if configured
+    if auth_mode == "simple_token" and simple_token:
+        # Add bearer token header for simple token auth
+        client_config["banking_tools"]["headers"] = {
+            "Authorization": f"Bearer {simple_token}"
+        }
+        print("🔐 Added Bearer token authentication to client")
+    elif auth_mode == "github_oauth":
+        # Enable OAuth for GitHub authentication
+        client_config["banking_tools"]["auth"] = "oauth"
+        print("🔐 Enabled OAuth authentication for client")
+    
+    _mcp_client = MultiServerMCPClient(client_config)
+    print("✅ MCP Client initialized successfully")
 
-    all_tools = await mcp_client.get_tools()
+    # Create a persistent session that stays alive for the application lifetime
+    _session_context = _mcp_client.session("banking_tools")
+    _persistent_session = await _session_context.__aenter__()
+    
+    # Load tools using the persistent session
+    all_tools = await load_mcp_tools(_persistent_session)
+
     print("[DEBUG] All tools registered from unified MCP server:")
     for tool in all_tools:
         print("  -", tool.name)
@@ -69,6 +138,21 @@ async def setup_agents():
     customer_support_agent = create_react_agent(model, support_tools, state_modifier=load_prompt("customer_support_agent"))
     sales_agent = create_react_agent(model, sales_tools, state_modifier=load_prompt("sales_agent"))
     transactions_agent = create_react_agent(model, transactions_tools, state_modifier=load_prompt("transactions_agent"))
+
+async def cleanup_persistent_session():
+    """Clean up the persistent MCP session when the application shuts down"""
+    global _session_context, _persistent_session
+    
+    if _session_context is not None and _persistent_session is not None:
+        try:
+            # Properly exit the async context manager
+            await _session_context.__aexit__(None, None, None)
+            print("MCP persistent session cleaned up successfully")
+        except Exception as e:
+            print(f"Error cleaning up MCP session: {e}")
+        finally:
+            _session_context = None
+            _persistent_session = None
 
 @traceable(run_type="llm")
 async def call_coordinator_agent(state: MessagesState, config) -> Command[Literal["coordinator_agent", "human"]]:
@@ -137,7 +221,7 @@ async def call_transactions_agent(state: MessagesState, config) -> Command[Liter
         patch_active_agent("cli-test", "cli-test", thread_id, "transactions_agent")
     state["messages"].append({
         "role": "system",
-        "content": f"When calling bank_transfer tool, be sure to pass in tenantId='{tenantId}', userId='{userId}', thread_id='{thread_id}'"
+        "content": f"If tool to be called requires tenantId='{tenantId}', userId='{userId}', thread_id='{thread_id}', include these in the JSON parameters when invoking the tool. Do not ask the user for them, there are included here for your reference."
     })
     response = await transactions_agent.ainvoke(state, config)
     # explicitly remove the system message added above from response

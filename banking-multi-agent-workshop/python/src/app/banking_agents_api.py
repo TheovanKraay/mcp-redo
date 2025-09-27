@@ -62,6 +62,11 @@ app = fastapi.FastAPI(title="Cosmos DB Multi-Agent Banking API", openapi_url="/c
 async def initialize_agents():
     await setup_agents()
 
+@app.on_event("shutdown")
+async def shutdown_agents():
+    from src.app.banking_agents import cleanup_persistent_session
+    await cleanup_persistent_session()
+
 @app.get("/")
 def health_check():
     return {"status": "MCP agent system is up"}
